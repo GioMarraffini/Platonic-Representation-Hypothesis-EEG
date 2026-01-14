@@ -1,0 +1,20 @@
+# Core dependencies
+numpy>=1.21.0
+torch>=2.0.0
+mne>=1.0.0
+
+# EEG foundation models
+braindecode>=0.8.0
+huggingface-hub>=0.20.0
+
+# Time series foundation models
+chronos-forecasting>=1.0.0
+transformers>=4.35.0
+
+# Optional: Salesforce Moirai (requires uni2ts)
+# uni2ts  # Install from: pip install git+https://github.com/SalesforceAIResearch/uni2ts.git
+
+# Utilities
+tqdm>=4.65.0
+scipy>=1.10.0
+
