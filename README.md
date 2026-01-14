@@ -27,8 +27,6 @@ source venv/bin/activate  # Linux/Mac
 # Install dependencies
 pip install -r requirements.txt
 
-# Optional: Install uni2ts for Moirai models
-pip install git+https://github.com/SalesforceAIResearch/uni2ts.git
 ```
 
 ## Project Structure
@@ -46,9 +44,7 @@ PRH+EEG/
 │   ├── registry.py          # Model registry
 │   ├── labram_extractor.py
 │   ├── chronos_extractor.py
-│   ├── cbramod_extractor.py
-│   ├── moirai_extractor.py
-│   └── timemoe_extractor.py
+│   └── cbramod_extractor.py
 ├── utils/                   # Utility functions
 │   ├── fif_utils.py         # .fif file loading
 │   └── synthetic.py         # Synthetic data generation
@@ -108,7 +104,12 @@ For each `.fif` file, the pipeline saves a `.npy` file with the same base name:
 - Input: `data/subject_001_raw.fif`
 - Output: `representations/labram/subject_001.npy`
 
-The embedding shape depends on the model but is typically `(embedding_dim,)` - a single vector per file, suitable for representational similarity analysis.
+**Embedding shapes:**
+- **LaBraM**: `(200,)` - single vector per file
+- **CBraMod**: `(n_channels, n_patches, 200)` - preserves spatial-temporal structure
+- **Chronos**: `(n_channels, context_length, d_model)` - preserves channel and temporal structure
+
+For RSA analysis, embeddings must have consistent shape **within** each model across files.
 
 ## Python API
 
@@ -144,7 +145,7 @@ for fif_path in get_fif_files("data/"):
 
 ## Representational Analysis
 
-Since all models output embeddings with the same dimensionality per file, you can easily compute:
+Each model outputs embeddings with consistent shape across files (within that model). For RSA, you compare representations within each model separately:
 
 ### Representational Similarity Analysis (RSA)
 
@@ -153,14 +154,11 @@ import numpy as np
 from scipy.spatial.distance import cosine
 from pathlib import Path
 
-# Load embeddings from two models
+# Load embeddings (flatten multi-dimensional embeddings for comparison)
 labram_dir = Path("representations/labram")
-chronos_dir = Path("representations/chronos")
+labram_embs = [np.load(f).flatten() for f in sorted(labram_dir.glob("*.npy"))]
 
-labram_embs = [np.load(f) for f in sorted(labram_dir.glob("*.npy"))]
-chronos_embs = [np.load(f) for f in sorted(chronos_dir.glob("*.npy"))]
-
-# Compute RDMs (Representational Dissimilarity Matrices)
+# Compute RDM
 def compute_rdm(embeddings):
     n = len(embeddings)
     rdm = np.zeros((n, n))
@@ -169,39 +167,29 @@ def compute_rdm(embeddings):
             rdm[i, j] = cosine(embeddings[i], embeddings[j])
     return rdm
 
-rdm_labram = compute_rdm(labram_embs)
-rdm_chronos = compute_rdm(chronos_embs)
-
-# Compare RDMs (Spearman correlation of upper triangles)
-from scipy.stats import spearmanr
-triu_idx = np.triu_indices(len(labram_embs), k=1)
-r, p = spearmanr(rdm_labram[triu_idx], rdm_chronos[triu_idx])
-print(f"RSA correlation: r={r:.3f}, p={p:.4f}")
+rdm = compute_rdm(labram_embs)
 ```
 
 ## Model Details
 
 ### LaBraM
-- **Input**: 19-channel EEG at 200 Hz
-- **Output**: 256-dimensional embedding
+- **Input**: EEG at 200 Hz (channels padded/truncated to 128)
+- **Output**: `(200,)` - single vector per file
+- **Embedding source**: fc_norm layer (before classifier)
 - **Reference**: [LaBraM Paper](https://github.com/935963004/LaBraM)
-
-### Chronos
-- **Input**: Univariate time series (processes each EEG channel independently)
-- **Output**: 512-dimensional embedding (T5-based)
-- **Sizes**: tiny, mini, small, base, large
-- **Reference**: [Chronos](https://github.com/amazon-science/chronos-forecasting)
 
 ### CBraMod
 - **Input**: Multi-channel EEG at 200 Hz
-- **Output**: 256-dimensional embedding
+- **Output**: `(n_channels, n_patches, 200)` - preserves spatial-temporal structure
+- **Embedding source**: Encoder output (before proj_out)
 - **Reference**: [CBraMod](https://github.com/wjq-learning/CBraMod)
 
-### Moirai
-- **Input**: Univariate time series
-- **Output**: Variable-dimensional embedding
-- **Sizes**: small, base, large
-- **Reference**: [Moirai](https://github.com/SalesforceAIResearch/uni2ts)
+### Chronos
+- **Input**: Univariate time series (processes each EEG channel independently)
+- **Output**: `(n_channels, context_length, d_model)` - preserves channel and temporal structure
+- **d_model by size**: tiny=256, mini=384, small=512, base=768, large=1024
+- **Embedding source**: Encoder hidden states via `embed()` method
+- **Reference**: [Chronos](https://github.com/amazon-science/chronos-forecasting)
 
 ## License
 
