@@ -104,10 +104,13 @@ For each `.fif` file, the pipeline saves a `.npy` file with the same base name:
 - Input: `data/subject_001_raw.fif`
 - Output: `representations/labram/subject_001.npy`
 
-**Embedding shapes:**
-- **LaBraM**: `(200,)` - single vector per file
-- **CBraMod**: `(n_channels, n_patches, 200)` - preserves spatial-temporal structure
+**Embedding shapes (first dimension is ALWAYS layers for N×M comparisons):**
+- **LaBraM**: `(n_layers, 200)` = `(12, 200)` - embeddings from all 12 transformer blocks
+- **CBraMod**: `(n_layers, n_channels, n_patches, 200)` = `(12, n_ch, n_patches, 200)` - all 12 encoder layers
 - **Chronos**: `(n_channels, context_length, d_model)` - preserves channel and temporal structure
+
+**Why multi-layer extraction?**
+For Platonic Representation Hypothesis analysis, you build distance matrices per layer, then make N×M comparisons of k-nearest neighbours across two models (with N and M layers respectively).
 
 For RSA analysis, embeddings must have consistent shape **within** each model across files.
 
@@ -174,14 +177,14 @@ rdm = compute_rdm(labram_embs)
 
 ### LaBraM
 - **Input**: EEG at 200 Hz (channels padded/truncated to 128)
-- **Output**: `(200,)` - single vector per file
-- **Embedding source**: fc_norm layer (before classifier)
+- **Output**: `(12, 200)` - embeddings from all 12 transformer blocks
+- **Embedding source**: Forward hooks on each transformer block, mean pooled
 - **Reference**: [LaBraM Paper](https://github.com/935963004/LaBraM)
 
 ### CBraMod
 - **Input**: Multi-channel EEG at 200 Hz
-- **Output**: `(n_channels, n_patches, 200)` - preserves spatial-temporal structure
-- **Embedding source**: Encoder output (before proj_out)
+- **Output**: `(12, n_channels, n_patches, 200)` - all 12 encoder layers
+- **Embedding source**: Forward hooks on each TransformerEncoderLayer
 - **Reference**: [CBraMod](https://github.com/wjq-learning/CBraMod)
 
 ### Chronos
