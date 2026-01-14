@@ -10,9 +10,12 @@ Architecture:
     → Classification Head
 
 Embedding extraction:
-    We use the `forward_features()` method which returns the 200-dimensional
-    representation AFTER mean pooling and fc_norm, BEFORE the classification head.
-    This is the standard approach for ViT-like models.
+    We extract embeddings from ALL 12 transformer blocks using forward hooks.
+    This enables N×M layer comparisons across models for the Platonic
+    Representation Hypothesis analysis.
+
+    Output shape: (n_layers, embedding_dim) = (12, 200)
+    First dimension is always the number of layers.
 
 Reference:
     - Paper: "Large Brain Model for Learning Generic Representations with Tremendous EEG Data in BCI"
@@ -23,7 +26,7 @@ Reference:
 import numpy as np
 import mne
 import torch
-from typing import Optional
+from typing import Optional, List
 from .base import BaseExtractor
 from .registry import register_extractor
 
@@ -38,12 +41,14 @@ class LaBraMExtractor(BaseExtractor):
     - 200 Hz sampling rate
     - Input shape: (batch, channels, time_samples)
     
-    Embedding is extracted from fc_norm layer (200-dim) using forward_features().
+    Embeddings are extracted from ALL 12 transformer blocks using forward hooks.
+    Output shape: (n_layers, 200) = (12, 200) where first dimension is layers.
     """
     
     MODEL_NAME = "labram"
     REQUIRED_SFREQ = 200.0  # LaBraM expects 200 Hz
     EMBEDDING_DIM = 200  # Output embedding dimension
+    NUM_LAYERS = 12  # Number of transformer blocks
     
     def __init__(
         self,
@@ -54,6 +59,8 @@ class LaBraMExtractor(BaseExtractor):
         super().__init__(device=device, layer_name=layer_name, verbose=verbose)
         self.n_chans_pretrained = 128  # Pretrained model has 128 channels
         self.n_times_pretrained = 3000  # 15 seconds at 200 Hz
+        self._layer_outputs: List[torch.Tensor] = []
+        self._hooks = []
     
     def load_model(self) -> None:
         """Load LaBraM pretrained model from HuggingFace via braindecode."""
@@ -68,11 +75,15 @@ class LaBraMExtractor(BaseExtractor):
             self.model = self.model.to(self.device)
             self.model.eval()
             
+            # Register hooks on all transformer blocks
+            self._register_layer_hooks()
+            
             self._is_loaded = True
             
             if self.verbose:
                 print(f"LaBraM loaded successfully!")
                 print(f"  - Embedding dimension: {self.EMBEDDING_DIM}")
+                print(f"  - Number of layers: {self.NUM_LAYERS}")
                 print(f"  - Expected channels: {self.n_chans_pretrained}")
                 print(f"  - Expected sfreq: {self.REQUIRED_SFREQ} Hz")
             
@@ -83,6 +94,22 @@ class LaBraMExtractor(BaseExtractor):
             )
         except Exception as e:
             raise RuntimeError(f"Failed to load LaBraM pretrained model: {e}")
+    
+    def _register_layer_hooks(self) -> None:
+        """Register forward hooks on all transformer blocks to capture layer outputs."""
+        def make_hook(layer_idx: int):
+            def hook(module, input, output):
+                # output shape: (batch, seq_len, embed_dim)
+                self._layer_outputs.append(output.detach())
+            return hook
+        
+        # LaBraM has self.model.blocks which is a ModuleList of transformer blocks
+        for i, block in enumerate(self.model.blocks):
+            hook = block.register_forward_hook(make_hook(i))
+            self._hooks.append(hook)
+        
+        if self.verbose:
+            print(f"  Registered hooks on {len(self._hooks)} transformer blocks")
     
     def _prepare_input(self, raw: mne.io.Raw) -> torch.Tensor:
         """
@@ -137,11 +164,12 @@ class LaBraMExtractor(BaseExtractor):
         """
         Extract embeddings from raw EEG data using LaBraM.
         
-        Uses the forward_features() method to get the 200-dim representation
-        from fc_norm (before the classification head).
+        Captures outputs from ALL 12 transformer blocks using forward hooks,
+        enabling N×M layer comparisons across models.
         
         Returns:
-            Embedding of shape (200,) - single vector per file
+            Embedding of shape (n_layers, 200) = (12, 200)
+            First dimension is layers, enabling layer-wise comparisons.
         """
         # Prepare input
         x = self._prepare_input(raw)  # (n_windows, 128, n_times)
@@ -149,22 +177,38 @@ class LaBraMExtractor(BaseExtractor):
         if self.verbose:
             print(f"  Input shape: {x.shape}")
         
-        # Extract embeddings using forward_features
-        embeddings_list = []
+        # Collect layer outputs across all windows
+        all_layer_embeddings = [[] for _ in range(self.NUM_LAYERS)]
         
         with torch.no_grad():
             for i in range(0, len(x), 8):  # Batch of 8
                 batch = x[i:i+8]
                 
-                # forward_features returns the embedding before classification head
-                emb = self.model.forward_features(batch)  # (batch, 200)
-                embeddings_list.append(emb.cpu().numpy())
+                # Clear previous layer outputs
+                self._layer_outputs = []
+                
+                # Forward pass triggers all hooks
+                _ = self.model.forward_features(batch)
+                
+                # Process layer outputs
+                # Each output is (batch, seq_len, embed_dim)
+                # We apply mean pooling to get (batch, embed_dim) per layer
+                for layer_idx, layer_out in enumerate(self._layer_outputs):
+                    # Mean pool across sequence dimension (same as forward_features does at the end)
+                    pooled = layer_out.mean(dim=1)  # (batch, embed_dim)
+                    all_layer_embeddings[layer_idx].append(pooled.cpu().numpy())
         
-        # Concatenate all window embeddings
-        embeddings = np.concatenate(embeddings_list, axis=0)  # (n_windows, 200)
+        # Concatenate windows and average for each layer
+        layer_embeddings = []
+        for layer_idx in range(self.NUM_LAYERS):
+            # Concatenate all batches: (total_windows, embed_dim)
+            layer_windows = np.concatenate(all_layer_embeddings[layer_idx], axis=0)
+            # Average across windows: (embed_dim,)
+            layer_avg = layer_windows.mean(axis=0)
+            layer_embeddings.append(layer_avg)
         
-        # Average across windows to get single representation per file
-        embedding = embeddings.mean(axis=0)  # (200,)
+        # Stack into (n_layers, embed_dim)
+        embedding = np.stack(layer_embeddings, axis=0)  # (12, 200)
         
         if self.verbose:
             print(f"  Output embedding shape: {embedding.shape}")

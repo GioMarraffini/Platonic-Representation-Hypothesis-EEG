@@ -64,11 +64,13 @@ class BaseExtractor(ABC):
             raw: MNE Raw object containing EEG data
             
         Returns:
-            numpy array of embeddings. Shape depends on model:
-            - (embedding_dim,) for single embedding per file
-            - (n_channels, embedding_dim) for per-channel embeddings
-            - (n_epochs, embedding_dim) for per-epoch embeddings
-            - (n_epochs, n_channels, embedding_dim) for per-epoch-per-channel
+            numpy array of embeddings. The FIRST DIMENSION is always the number
+            of layers (for multi-layer extraction to enable N×M comparisons).
+            
+            Typical shapes:
+            - (n_layers, embedding_dim) for LaBraM: (12, 200)
+            - (n_layers, n_channels, n_patches, embedding_dim) for CBraMod: (12, n_ch, n_patches, 200)
+            - (n_layers, n_channels, seq_len, d_model) for time series models
         """
         pass
     

@@ -10,8 +10,12 @@ Architecture:
     → Output Projection (Linear) → (batch, ch, patches, 200)
 
 Embedding extraction:
-    We extract from the encoder output and mean pool across channels and patches
-    to get a 200-dimensional representation per file.
+    We extract embeddings from ALL 12 transformer encoder layers using forward hooks.
+    This enables N×M layer comparisons across models for the Platonic
+    Representation Hypothesis analysis.
+
+    Output shape: (n_layers, n_channels, n_patches, 200) = (12, n_ch, n_patches, 200)
+    First dimension is always the number of layers.
 
 Reference:
     - Paper: "CBraMod: A Criss-Cross Brain Foundation Model for EEG Decoding"
@@ -24,7 +28,7 @@ import mne
 import torch
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from .base import BaseExtractor
 from .registry import register_extractor
 
@@ -38,15 +42,16 @@ class CBraModExtractor(BaseExtractor):
     - Input shape: (batch, ch_num, patch_num, patch_size=200)
     - patch_size=200 samples (1 second at 200 Hz)
     
-    Embedding is extracted from encoder output and mean pooled:
-    - encoder output: (batch, ch_num, patch_num, 200)
-    - mean pool → (batch, 200) → (200,) per file
+    Embeddings are extracted from ALL 12 transformer encoder layers using forward hooks.
+    Output shape: (n_layers, n_ch, n_patches, 200) = (12, n_ch, n_patches, 200)
+    First dimension is layers, enabling layer-wise comparisons.
     """
     
     MODEL_NAME = "cbramod"
     REQUIRED_SFREQ = 200.0  # CBraMod expects 200 Hz
     EMBEDDING_DIM = 200  # Output embedding dimension
     PATCH_SIZE = 200  # 1 second at 200 Hz
+    NUM_LAYERS = 12  # Number of transformer encoder layers
     
     def __init__(
         self,
@@ -55,7 +60,8 @@ class CBraModExtractor(BaseExtractor):
         verbose: bool = False,
     ):
         super().__init__(device=device, layer_name=layer_name, verbose=verbose)
-        self._encoder_output = None
+        self._layer_outputs: List[torch.Tensor] = []
+        self._hooks = []
     
     def load_model(self) -> None:
         """Load CBraMod pretrained model from HuggingFace using official code."""
@@ -124,27 +130,36 @@ class CBraModExtractor(BaseExtractor):
             self.model = self.model.to(self.device)
             self.model.eval()
             
-            # Register hook on encoder to capture output before proj_out
-            self._register_encoder_hook()
+            # Register hooks on all encoder layers to capture outputs
+            self._register_layer_hooks()
             
             self._is_loaded = True
             
             if self.verbose:
                 print(f"CBraMod loaded successfully!")
                 print(f"  - Embedding dimension: {self.EMBEDDING_DIM}")
+                print(f"  - Number of layers: {self.NUM_LAYERS}")
                 print(f"  - Patch size: {self.PATCH_SIZE} samples")
                 print(f"  - Expected sfreq: {self.REQUIRED_SFREQ} Hz")
             
         except Exception as e:
             raise RuntimeError(f"Failed to load CBraMod pretrained model: {e}")
     
-    def _register_encoder_hook(self):
-        """Register hook to capture encoder output before proj_out."""
-        def hook(module, input, output):
-            self._encoder_output = output.detach()
+    def _register_layer_hooks(self) -> None:
+        """Register forward hooks on all encoder layers to capture outputs."""
+        def make_hook(layer_idx: int):
+            def hook(module, input, output):
+                # output shape: (batch, ch_num, patch_num, d_model)
+                self._layer_outputs.append(output.detach())
+            return hook
         
-        # Hook on the encoder (the TransformerEncoder)
-        self.model.encoder.register_forward_hook(hook)
+        # CBraMod encoder has self.model.encoder.layers which is a ModuleList
+        for i, layer in enumerate(self.model.encoder.layers):
+            hook = layer.register_forward_hook(make_hook(i))
+            self._hooks.append(hook)
+        
+        if self.verbose:
+            print(f"  Registered hooks on {len(self._hooks)} encoder layers")
     
     def _prepare_input(self, raw: mne.io.Raw) -> torch.Tensor:
         """
@@ -186,11 +201,12 @@ class CBraModExtractor(BaseExtractor):
         """
         Extract embeddings from raw EEG data using CBraMod.
         
-        Uses encoder output (before proj_out), preserving full spatial-temporal structure.
+        Captures outputs from ALL 12 transformer encoder layers using forward hooks,
+        enabling N×M layer comparisons across models.
         
         Returns:
-            Embedding of shape (n_channels, n_patches, 200) - preserves structure
-            For RSA, this full tensor is compared across files.
+            Embedding of shape (n_layers, n_channels, n_patches, 200) = (12, n_ch, n_patches, 200)
+            First dimension is layers, enabling layer-wise comparisons.
         """
         # Prepare input
         x = self._prepare_input(raw)  # (1, n_channels, n_patches, 200)
@@ -198,19 +214,23 @@ class CBraModExtractor(BaseExtractor):
         if self.verbose:
             print(f"  Input shape: {x.shape}")
         
-        # Forward pass (hook captures encoder output)
+        # Clear previous layer outputs
+        self._layer_outputs = []
+        
+        # Forward pass (hooks capture all layer outputs)
         with torch.no_grad():
             _ = self.model(x)
         
-        # Get encoder output (before proj_out)
-        if self._encoder_output is not None:
-            feats = self._encoder_output  # (1, ch, patches, 200)
-        else:
-            # Fallback: use model output
-            feats = self.model(x)
+        # Stack all layer outputs
+        # Each layer output is (1, ch, patches, 200)
+        layer_embeddings = []
+        for layer_out in self._layer_outputs:
+            # Remove batch dimension: (ch, patches, 200)
+            layer_emb = layer_out.squeeze(0).cpu().numpy()
+            layer_embeddings.append(layer_emb)
         
-        # Remove batch dimension, keep full (n_channels, n_patches, 200) structure
-        embedding = feats.squeeze(0).cpu().numpy()  # (n_channels, n_patches, 200)
+        # Stack into (n_layers, n_ch, n_patches, 200)
+        embedding = np.stack(layer_embeddings, axis=0)
         
         if self.verbose:
             print(f"  Output embedding shape: {embedding.shape}")
